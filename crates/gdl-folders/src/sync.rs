@@ -107,6 +107,10 @@ pub struct FolderSync {
     /// Quantos itens as comparações já mandaram para a lixeira do sistema (para o aviso: quem
     /// ouve avisa a diferença, e duas comparações seguidas não se perdem).
     trashed: tokio::sync::watch::Sender<usize>,
+    /// Quantas ações da comparação em curso ainda faltam aplicar (envios, downloads, pastas a
+    /// criar, itens para a lixeira); zero fora de uma comparação. É o que a bandeja e a janela
+    /// somam ao "sincronizando".
+    pending: tokio::sync::watch::Sender<usize>,
     /// Os caminhos relativos cujo emblema mudou desde `take_synced`: ficaram sincronizados ou
     /// entraram ou saíram da lista de falhas (para os emblemas;
     /// um caminho que some ou muda de nome o gerenciador de arquivos já redesenha sozinho).
@@ -140,6 +144,7 @@ impl FolderSync {
             wake: tokio::sync::Notify::new(),
             state_changed: tokio::sync::watch::Sender::new(state),
             trashed: tokio::sync::watch::Sender::new(0),
+            pending: tokio::sync::watch::Sender::new(0),
             newly_synced: Mutex::default(),
             failed: Mutex::default(),
             synced_notify: tokio::sync::Notify::new(),
@@ -193,6 +198,24 @@ impl FolderSync {
     /// Avisa a cada comparação que mandou itens para a lixeira do sistema, com o total até aqui.
     pub fn trashed_changes(&self) -> tokio::sync::watch::Receiver<usize> {
         self.trashed.subscribe()
+    }
+
+    /// Quantas ações a comparação em curso ainda tem por aplicar (zero fora de uma comparação).
+    pub fn pending(&self) -> usize {
+        *self.pending.borrow()
+    }
+
+    /// Avisa a cada mudança de `pending`.
+    pub fn pending_changes(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.pending.subscribe()
+    }
+
+    /// Grava `pending`, avisando só se mudou.
+    fn set_pending(&self, change: impl FnOnce(usize) -> usize) {
+        self.pending.send_if_modified(|pending| {
+            let new = change(*pending);
+            std::mem::replace(pending, new) != new
+        });
     }
 
     /// Quantos caminhos do computador ainda não foram para o Drive como estão aqui (novos ou
@@ -291,6 +314,14 @@ impl FolderSync {
     /// Compara os dois lados e aplica o que mudou. Com a pasta do computador inacessível, o par
     /// para (`PairState::Stopped`) sem tocar em nada: nunca é tratado como "tudo excluído".
     pub async fn reconcile(&self) -> Result<Report> {
+        // Saia como sair, a comparação termina sem nada pendente.
+        struct Idle<'a>(&'a FolderSync);
+        impl Drop for Idle<'_> {
+            fn drop(&mut self) {
+                self.0.set_pending(|_| 0);
+            }
+        }
+        let _idle = Idle(self);
         if let Some(reason) = guard::root_problem(&self.pair.local).or(self.unmounted()?) {
             tracing::warn!(pair = self.pair.id, ?reason, "pasta do par inacessível");
             self.set_state(PairState::Stopped(reason))?;
@@ -378,14 +409,15 @@ impl FolderSync {
             true => PairState::ConfirmDeletes(deletes as u64),
             false => PairState::Active,
         })?;
+        self.set_pending(|_| plan.len());
         for (rel, action) in plan {
-            if v.gone.as_deref().is_some_and(|g| inside(&rel, g)) {
-                continue;
+            if !v.gone.as_deref().is_some_and(|g| inside(&rel, g)) {
+                match self.apply(&mut v, &rel, action).await {
+                    Ok(()) => report.applied += 1,
+                    Err(e) => self.failed(report, rel, e),
+                }
             }
-            match self.apply(&mut v, &rel, action).await {
-                Ok(()) => report.applied += 1,
-                Err(e) => self.failed(report, rel, e),
-            }
+            self.set_pending(|pending| pending.saturating_sub(1));
         }
         self.write_links(&v, report);
         report.trashed += v.trashed;
@@ -1524,6 +1556,35 @@ mod tests {
         let report = sync.reconcile().await.unwrap();
         assert_eq!(w.fake.find_live("a.txt").len(), 1);
         assert_eq!((report.held, report.failed.len()), (0, 0));
+    }
+
+    /// Durante a comparação, `pending` diz quantas ações faltam (a bandeja mostra
+    /// "sincronizando" por ele); ao fim, zero.
+    #[tokio::test]
+    async fn pending_counts_down_during_a_pass() {
+        let w = World::new().await;
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            w.write(name, b"x");
+        }
+        let seen = Arc::new(Mutex::new(vec![]));
+        let pending = Arc::new(std::sync::OnceLock::new());
+        let screen = {
+            let (seen, pending) = (seen.clone(), pending.clone());
+            move |_name: &str, _path: &Path, _rewrite: bool| {
+                let pending: &tokio::sync::watch::Receiver<usize> = pending.get().unwrap();
+                seen.lock().unwrap().push(*pending.borrow());
+                true
+            }
+        };
+        let sync = w.sync_with(8).with_screen(Arc::new(screen));
+        pending.set(sync.pending_changes()).unwrap();
+
+        w.refresh().await;
+        assert_eq!(sync.pending(), 0);
+        sync.reconcile().await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), [3, 2, 1]);
+        assert_eq!(sync.pending(), 0);
     }
 
     /// A vigia sabe se o envio substitui uma versão do Drive: o arquivo novo não (o primeiro
