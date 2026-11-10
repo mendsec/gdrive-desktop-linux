@@ -77,9 +77,10 @@ pub struct Links {
     pub shortcut_targets: PathBuf,
 }
 
-/// Confere cada arquivo antes de ele subir (`nome`, caminho): `false` segura o envio até a
-/// próxima comparação (a vigia de atividade suspeita do motor, `Engine::screen_write`).
-pub type Screen = Arc<dyn Fn(&str, &Path) -> bool + Send + Sync>;
+/// Confere cada arquivo antes de ele subir (`nome`, caminho, se substitui uma versão que já
+/// está no Drive): `false` segura o envio até a próxima comparação (a vigia de atividade
+/// suspeita do motor, `Engine::screen_write`; o arquivo novo, `Engine::screen_new_file`).
+pub type Screen = Arc<dyn Fn(&str, &Path, bool) -> bool + Send + Sync>;
 
 /// O `md5` da base de um ponteiro ou link gravado pelo app: ele nunca sobe, e vai para a lixeira
 /// quando o item sai do Drive.
@@ -638,7 +639,7 @@ impl FolderSync {
         if self
             .screen
             .as_ref()
-            .is_some_and(|screen| !screen(last(rel), &path))
+            .is_some_and(|screen| !screen(last(rel), &path, existing.is_some()))
         {
             return Err(SyncError::Held);
         }
@@ -1451,7 +1452,7 @@ mod tests {
         let screened = Arc::new(Mutex::new(vec![]));
         let screen = {
             let (allowed, screened) = (allowed.clone(), screened.clone());
-            move |name: &str, path: &Path| {
+            move |name: &str, path: &Path, _rewrite: bool| {
                 screened
                     .lock()
                     .unwrap()
@@ -1472,6 +1473,34 @@ mod tests {
         allowed.store(true, std::sync::atomic::Ordering::SeqCst);
         sync.reconcile().await.unwrap();
         assert_eq!(w.fake.find_live("a.txt").len(), 1);
+    }
+
+    /// A vigia sabe se o envio substitui uma versão do Drive: o arquivo novo não (o primeiro
+    /// envio de uma pasta não conta como atividade suspeita), a edição de um já enviado sim.
+    #[tokio::test]
+    async fn screen_tells_new_files_from_rewrites() {
+        let w = World::new().await;
+        w.write("a.txt", b"um");
+        let rewrites = Arc::new(Mutex::new(vec![]));
+        let screen = {
+            let rewrites = rewrites.clone();
+            move |name: &str, _path: &Path, rewrite: bool| {
+                rewrites.lock().unwrap().push((name.to_owned(), rewrite));
+                true
+            }
+        };
+        let sync = w.sync_with(8).with_screen(Arc::new(screen));
+
+        w.refresh().await;
+        sync.reconcile().await.unwrap();
+        w.write("a.txt", b"dois, editado");
+        w.refresh().await;
+        sync.reconcile().await.unwrap();
+
+        assert_eq!(
+            *rewrites.lock().unwrap(),
+            [("a.txt".to_owned(), false), ("a.txt".to_owned(), true)]
+        );
     }
 
     #[tokio::test]
