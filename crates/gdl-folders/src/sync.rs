@@ -58,6 +58,8 @@ pub struct Report {
     pub failed: Vec<Failure>,
     /// Itens locais que foram para a lixeira do sistema porque saíram do Drive.
     pub trashed: usize,
+    /// Quantos dos `failed` são envios segurados pela vigia de atividade suspeita.
+    pub held: usize,
 }
 
 /// Um caminho do par que não sincronizou.
@@ -294,6 +296,7 @@ impl FolderSync {
         let mut report = Report::default();
         for _ in 0..MAX_PASSES {
             report.failed.clear();
+            report.held = 0;
             match self.pass(&mut report).await {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -313,6 +316,14 @@ impl FolderSync {
         }
         if report.trashed > 0 {
             self.trashed.send_modify(|total| *total += report.trashed);
+        }
+        if report.held > 0 {
+            // Um aviso por comparação, não um por arquivo: a pausa pode durar horas.
+            tracing::warn!(
+                pair = self.pair.id,
+                arquivos = report.held,
+                "envios segurados: atividade suspeita nos arquivos"
+            );
         }
         self.remember_failed(&report);
         Ok(report)
@@ -368,7 +379,12 @@ impl FolderSync {
     }
 
     fn failed(&self, report: &mut Report, rel: String, e: SyncError) {
-        tracing::warn!(pair = self.pair.id, rel, "falha ao sincronizar: {e}");
+        if matches!(e, SyncError::Held) {
+            report.held += 1;
+            tracing::debug!(pair = self.pair.id, rel, "falha ao sincronizar: {e}");
+        } else {
+            tracing::warn!(pair = self.pair.id, rel, "falha ao sincronizar: {e}");
+        }
         let category = folder_category(match &e {
             SyncError::Drive(e) => ErrorCategory::of(e),
             SyncError::Engine(e) => ErrorCategory::of_engine(e),
@@ -1463,16 +1479,18 @@ mod tests {
         let sync = w.sync_with(8).with_screen(Arc::new(screen));
 
         w.refresh().await;
-        sync.reconcile().await.unwrap();
+        let report = sync.reconcile().await.unwrap();
         assert!(
             w.fake.find_live("a.txt").is_empty(),
             "a vigia segurou o envio"
         );
         assert_eq!(*screened.lock().unwrap(), [("a.txt".to_owned(), true)]);
+        assert_eq!((report.held, report.failed.len()), (1, 1));
 
         allowed.store(true, std::sync::atomic::Ordering::SeqCst);
-        sync.reconcile().await.unwrap();
+        let report = sync.reconcile().await.unwrap();
         assert_eq!(w.fake.find_live("a.txt").len(), 1);
+        assert_eq!((report.held, report.failed.len()), (0, 0));
     }
 
     /// A vigia sabe se o envio substitui uma versão do Drive: o arquivo novo não (o primeiro
