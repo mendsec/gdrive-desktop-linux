@@ -402,6 +402,12 @@ impl Engine {
     }
 
     /// Muda a cada registro novo na atividade.
+    /// O registro da atividade da conta, para quem sincroniza por fora da montagem (as pastas
+    /// do computador) pôr os próprios envios e downloads na mesma lista.
+    pub fn activity_log(&self) -> Arc<ActivityLog> {
+        self.activity.clone()
+    }
+
     pub fn activity_changes(&self) -> watch::Receiver<u64> {
         self.activity.subscribe()
     }

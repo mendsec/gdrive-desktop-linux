@@ -13,6 +13,7 @@ use gdl_common::names::{fit, split_ext, to_remote};
 use gdl_common::temp_files::is_local_only;
 use gdl_drive::client::{DriveClient, RemoteFile, SessionSlot};
 use gdl_drive::model::Change;
+use gdl_engine::activity::{ActivityLog, ActivityState};
 use gdl_engine::errors::ErrorCategory;
 use gdl_store::folders::{Pair, PairKind, PairState, StopReason, Synced};
 use gdl_store::{Item, ItemId, ItemKind, Store};
@@ -123,6 +124,8 @@ pub struct FolderSync {
     /// A raiz é um ponto de montagem agora (injetável nos testes).
     is_mount_point: fn(&Path) -> bool,
     screen: Option<Screen>,
+    /// A lista de atividade da conta: o que o par envia e baixa aparece nela.
+    activity: Option<Arc<ActivityLog>>,
 }
 
 impl FolderSync {
@@ -151,6 +154,7 @@ impl FolderSync {
             links: None,
             is_mount_point: guard::is_mount_point,
             screen: None,
+            activity: None,
         }
     }
 
@@ -164,6 +168,22 @@ impl FolderSync {
     pub fn with_screen(mut self, screen: Screen) -> FolderSync {
         self.screen = Some(screen);
         self
+    }
+
+    /// Registra os envios e os downloads do par na atividade da conta (a janela principal).
+    pub fn with_activity(mut self, activity: Arc<ActivityLog>) -> FolderSync {
+        self.activity = Some(activity);
+        self
+    }
+
+    /// Registra o estado do item `id` na atividade, se ele está no banco (a linha é por item).
+    fn note(&self, id: &str, state: ActivityState) {
+        let Some(activity) = &self.activity else {
+            return;
+        };
+        if let Ok(Some(item)) = self.store.get(&ItemId(id.into())) {
+            activity.note(&self.store, &item, state, None);
+        }
     }
 
     /// Grava também os documentos Google e os atalhos (o Espelho).
@@ -644,7 +664,10 @@ impl FolderSync {
             Action::Download => {
                 let r = remote.expect("lado do Drive");
                 match self.download(&path, &r, local).await? {
-                    Some(l) => self.put(rel, &r.id.0, l, r.md5)?,
+                    Some(l) => {
+                        self.put(rel, &r.id.0, l, r.md5)?;
+                        self.note(&r.id.0, ActivityState::Downloaded);
+                    }
                     // O arquivo mudou durante o download: a próxima passada decide de novo.
                     None => v.again = true,
                 }
@@ -712,11 +735,19 @@ impl FolderSync {
             stamp: format!("{}:{}", sent.size, sent.mtime_ns),
         };
         let modified_ms = sent.mtime_ns / 1_000_000;
+        // O arquivo novo só ganha linha na atividade depois de subir: antes disso ele não é um
+        // item do Drive.
         let r = match existing {
             Some(id) => {
-                self.client
+                self.note(id, ActivityState::Uploading);
+                let sent = self
+                    .client
                     .upload_update(id, &path, modified_ms, &session)
-                    .await?
+                    .await;
+                if sent.is_err() {
+                    self.note(id, ActivityState::UploadFailed);
+                }
+                sent?
             }
             None => {
                 self.client
@@ -725,6 +756,7 @@ impl FolderSync {
             }
         };
         self.remember(r.clone())?;
+        self.note(&r.id, ActivityState::Uploaded);
         Ok((r, sent))
     }
 
@@ -1556,6 +1588,43 @@ mod tests {
         let report = sync.reconcile().await.unwrap();
         assert_eq!(w.fake.find_live("a.txt").len(), 1);
         assert_eq!((report.held, report.failed.len()), (0, 0));
+    }
+
+    /// O que o par envia e baixa aparece na atividade da conta, o mais recente primeiro.
+    #[tokio::test]
+    async fn transfers_show_in_the_activity() {
+        let w = World::new().await;
+        w.write("sobe.txt", b"daqui");
+        let log = Arc::new(ActivityLog::default());
+        let sync = w.sync_with(8).with_activity(log.clone());
+        let rows = || -> Vec<(String, ActivityState)> {
+            log.rows()
+                .into_iter()
+                .map(|r| (r.name.clone(), r.state))
+                .collect()
+        };
+
+        w.refresh().await;
+        sync.reconcile().await.unwrap();
+        assert_eq!(rows(), [("sobe.txt".to_owned(), ActivityState::Uploaded)]);
+
+        w.fake
+            .add_file(&w.pair.remote_id.0, "desce.txt", b"de la".to_vec());
+        w.refresh().await;
+        sync.reconcile().await.unwrap();
+        assert_eq!(
+            rows(),
+            [
+                ("desce.txt".to_owned(), ActivityState::Downloaded),
+                ("sobe.txt".to_owned(), ActivityState::Uploaded),
+            ]
+        );
+
+        w.write("sobe.txt", b"daqui, editado");
+        w.refresh().await;
+        sync.reconcile().await.unwrap();
+        assert_eq!(rows()[0], ("sobe.txt".to_owned(), ActivityState::Uploaded));
+        assert_eq!(rows().len(), 2, "uma linha por item");
     }
 
     /// Durante a comparação, `pending` diz quantas ações faltam (a bandeja mostra

@@ -227,7 +227,10 @@ impl Daemon {
                 })
             }
         };
-        let sync = Arc::new(sync.with_screen(Arc::new(screen)));
+        let sync = sync
+            .with_screen(Arc::new(screen))
+            .with_activity(engine.activity_log());
+        let sync = Arc::new(sync);
         let stop = shutdown.child_token();
         let running = tokio::spawn({
             let (sync, stop, events) = (sync.clone(), stop.clone(), engine.subscribe());
